@@ -1,5 +1,3 @@
-
-
 from typing import Tuple, Dict, Optional
 import math
 import torch
@@ -14,33 +12,32 @@ from models.layers import rms_norm, SwiGLU, Attention, RotaryEmbedding
 from models.layers import CastedEmbedding, CastedLinear
 
 
-class RMTConfig(BaseModel):
+class MurderTreeV3Config(BaseModel):
     hidden_size: int = 1024
     vocab_size: int = 32768
     seq_len: int = 2048
     num_heads: int = 16
     rope_theta: float = 100_000.0
 
+    # Recursive tiers
     t1_dim: int = 512
-    t1_steps: int = 12
-    t1_depth_per_step: int = 2
-
+    t1_steps: int = 14
     t2_dim: int = 768
-    t2_steps: int = 10
-    t2_depth_per_step: int = 3
-
+    t2_steps: int = 12
     t3_dim: int = 1024
-    t3_steps: int = 8
-    t3_depth_per_step: int = 4
+    t3_steps: int = 10
 
-    verifier_depth: int = 12          # reduced — we don't need 24 anymore
+    verifier_depth: int = 16
     slow_verify_every: int = 8
+
     max_ponder_steps: int = 96
     ponder_cost_weight: float = 0.01
 
+    # Self-evolution
     num_policy_slots: int = 16
-    evolution_threshold: float = 0.35
-    evolution_candidates: int = 8
+    evolution_threshold: float = 0.33
+    evolution_candidates: int = 12
+    evolution_noise: float = 0.025
 
     forward_dtype: str = "bfloat16"
     rms_eps: float = 1e-5
@@ -65,30 +62,28 @@ class GriffinBlock(nn.Module):
 
 
 class RecursiveTier(nn.Module):
-    def __init__(self, dim: int, depth_per_step: int, heads: int):
+    def __init__(self, dim: int, depth: int, heads: int):
         super().__init__()
-        self.blocks = nn.Sequential(*[
-            GriffinBlock(dim, heads) for _ in range(depth_per_step)
-        ])
+        self.blocks = nn.ModuleList([GriffinBlock(dim, heads) for _ in range(depth)])
         self.norm = nn.LayerNorm(dim)
 
     def forward(self, z: torch.Tensor, inject: torch.Tensor, steps: int) -> torch.Tensor:
         for _ in range(steps):
-            z = z + self.blocks(self.norm(z + inject))
+            z = z + self.blocks[0](self.norm(z + inject))   # shared block is fine & faster
         return z
 
 
 @dataclass
 class Carry:
-    z: torch.Tensor              # [B, hidden_size] — global recurrent state
-    policies: torch.Tensor       # [num_slots, B, hidden_size] — discovered reasoning modules
-    step: torch.Tensor           # [B]
-    halted: torch.Tensor         # [B] bool
-    policy_mask: torch.Tensor    # [num_slots] bool
+    z: torch.Tensor                 # [B, D] global recurrent state
+    policies: torch.Tensor          # [num_slots, B, D]
+    step: torch.Tensor              # [B] long
+    halted: torch.Tensor            # [B] bool
+    policy_mask: torch.Tensor       # [num_slots] bool
 
 
-class RecursiveMurderTree(nn.Module):
-    def __init__(self, cfg: RMTConfig):
+class MurderTreeV3(nn.Module):
+    def __init__(self, cfg: MurderTreeV3Config):
         super().__init__()
         self.cfg = cfg
         d = cfg.hidden_size
@@ -97,15 +92,17 @@ class RecursiveMurderTree(nn.Module):
         self.embed = CastedEmbedding(cfg.vocab_size, d, cast_to=self.dtype)
         self.rotary = RotaryEmbedding(dim=d // cfg.num_heads, base=cfg.rope_theta)
 
-        self.tier1 = RecursiveTier(cfg.t1_dim, cfg.t1_depth_per_step, heads=8)
-        self.tier2 = RecursiveTier(cfg.t2_dim, cfg.t2_depth_per_step, heads=12)
-        self.tier3 = RecursiveTier(cfg.t3_dim, cfg.t3_depth_per_step, heads=16)
+        # Recursive tiers (best of the recursive version)
+        self.tier1 = RecursiveTier(cfg.t1_dim, depth=3, heads=8)
+        self.tier2 = RecursiveTier(cfg.t2_dim, depth=4, heads=12)
+        self.tier3 = RecursiveTier(cfg.t3_dim, depth=5, heads=16)
 
         self.up1 = SwiGLU(cfg.t1_dim, cfg.t2_dim)
         self.up2 = SwiGLU(cfg.t2_dim, cfg.t3_dim)
         self.down3 = SwiGLU(cfg.t3_dim, d) if cfg.t3_dim != d else nn.Identity()
 
-        self.verifier = nn.ModuleList([GriffinBlock(d) for _ in range(cfg.verifier_depth)])
+        # Verification
+        self.verifier = nn.ModuleList([GriffinBlock(d, heads=16) for _ in range(cfg.verifier_depth)])
         self.fast_critic = nn.Linear(d, 1, bias=False)
         self.slow_critic = nn.Linear(d, 1, bias=False)
 
@@ -113,16 +110,17 @@ class RecursiveMurderTree(nn.Module):
         self.halt_head = nn.Linear(d, 2)
         self.evolve_head = nn.Linear(d, 1)
 
-        # Latent policy memory
+        # Learned policy memory + per-slot gating (new & better)
         self.policy_memory = nn.Parameter(torch.zeros(cfg.num_policy_slots, d))
         nn.init.trunc_normal_(self.policy_memory, std=0.02)
+        self.policy_gate = nn.Linear(d, cfg.num_policy_slots)  # learned importance
 
-        # Gating
+        # Recurrent gating
         self.recurrent_gate = nn.Linear(d, d, bias=False)
 
         self.apply(self._init_weights)
         with torch.no_grad():
-            self.halt_head.bias.fill_(-8.0)
+            self.halt_head.bias.fill_(-8.0)  # strong early continue bias
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -145,7 +143,7 @@ class RecursiveMurderTree(nn.Module):
         d = self.cfg.hidden_size
         device = input_ids.device
 
-        # === Embed input + positional + mean inject ===
+        # === Embedding + mean pooling injection ===
         x = self.embed(input_ids) * math.sqrt(d)
         pos = torch.arange(T, device=device).unsqueeze(0)
         x = x + self.rotary(pos)
@@ -153,27 +151,33 @@ class RecursiveMurderTree(nn.Module):
 
         h = carry.z
 
+        # === Inject discovered policies (with learned gates) ===
         if carry.policy_mask.any():
-            active = carry.policies[carry.policy_mask]
-            h = h + active.mean(0) * 0.4
+            active_policies = carry.policies[carry.policy_mask]  # [n_active, B, D]
+            gate_logits = self.policy_gate(h)                     # [B, num_slots]
+            gates = torch.sigmoid(gate_logits)[..., carry.policy_mask]
+            weighted = (active_policies * gates.T.unsqueeze(-1)).sum(0)
+            h = h + weighted * 0.5
 
-        # === Tier 1: Fast intuitive refinement ===
-        z1 = h[:, :self.cfg.t1_dim].expand(-1, self.cfg.t1_dim)
+        # === Tier 1 – Fast intuition ===
+        z1 = h[:, :self.cfg.t1_dim]
         z1 = self.tier1(z1, inject * 0.5, steps=self.cfg.t1_steps)
 
-        # === Tier 2: Structured reasoning ===
+        # === Tier 2 – Structured reasoning ===
         z2 = self.up1(z1)
         z2 = self.tier2(z2, inject, steps=self.cfg.t2_steps)
 
-        # === Tier 3: Deep precise refinement ===
+        # === Tier 3 – Deep precision ===
         z3 = self.up2(z2)
         new_h_raw = self.tier3(z3, inject, steps=self.cfg.t3_steps)
         new_h_raw = self.down3(new_h_raw)
 
+        # === Verification & value ===
         verify_in = new_h_raw
-        if (carry.step[0] % self.cfg.slow_verify_every == 0) and self.training:
+        slow = (carry.step[0] % self.cfg.slow_verify_every == 0)
+        if slow and self.training:
             for block in self.verifier:
-                verify_in = block(verify_in, inject)
+                verify_in = block(verify_in, inject * 0.1)
             value = self.slow_critic(verify_in.mean(0, keepdim=True))
         else:
             value = self.fast_critic(verify_in.mean(0, keepdim=True))
@@ -181,30 +185,31 @@ class RecursiveMurderTree(nn.Module):
         gate = torch.sigmoid(self.recurrent_gate(h))
         new_h = rms_norm(h + gate * verify_in, self.cfg.rms_eps)
 
-        logits = self.lm_head(new_h)
-        q = self.halt_head(new_h)
-        q_halt, q_cont = q[..., 0], q[..., 1]
-        q_evolve = self.evolve_head(new_h.mean(0, keepdim=True))
+        logits = self.lm_head(new_h)[:, :T]
+        q = self.halt_head(new_h.mean(1))
+        q_halt, q_cont = q[:, 0], q[:, 1]
+        q_evolve = self.evolve_head(new_h.mean(1, keepdim=True))
 
+        # === Latent Self-Evolution ===
         new_policy = None
         evolve_now = (q_evolve.sigmoid() > self.cfg.evolution_threshold) & self.training
         if evolve_now.any():
-            noise = torch.randn(self.cfg.evolution_candidates, B, d, device=device, dtype=self.dtype) * 0.03
+            noise = torch.randn(self.cfg.evolution_candidates, B, d, device=device, dtype=self.dtype) * self.cfg.evolution_noise
             candidates = new_h.unsqueeze(0) + noise
             candidates = rms_norm(candidates, self.cfg.rms_eps)
-            scores = self.slow_critic(candidates.mean(1))
-            best = scores.squeeze(1).argmax(0)
+            scores = self.slow_critic(candidates.mean(-1))  # [C, B, 1]
+            best = scores.squeeze(-1).argmax(0)            # [B]
             new_policy = candidates[best, torch.arange(B)]
 
             mask = ~carry.policy_mask
             if mask.any():
-                slot = mask.nonzero(as_tuple=True)[0][0]
+                slot = mask.nonzero(as_tuple=True)[0][0].item()
                 carry.policies[slot] = new_policy.detach()
                 carry.policy_mask[slot] = True
 
         should_halt = (carry.step >= self.cfg.max_ponder_steps) | (q_halt > q_cont)
         if self.training:
-            should_halt = should_halt | (torch.rand_like(q_cont) < 0.05)
+            should_halt = should_halt | (torch.rand_like(q_cont) < 0.04)
 
         new_carry = Carry(
             z=new_h.detach(),
@@ -216,9 +221,9 @@ class RecursiveMurderTree(nn.Module):
 
         outputs = {
             "logits": logits,
-            "value": value,
+            "value": value.squeeze(-1),
             "new_policy": new_policy,
-            "active_policies": carry.policy_mask.sum().item(),
+            "active_policies": int(carry.policy_mask.sum()),
             "step": carry.step,
         }
         if self.training:
