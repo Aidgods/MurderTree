@@ -1,285 +1,278 @@
-from typing import Tuple, List, Dict, Optional
+# hierarchical_reasoning_act_v2_fixed.py
+# "MurderTree v2 — Fixed & Runnable" (Nov 2025)
+from typing import Tuple, Dict, Optional
 from dataclasses import dataclass
 import math
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torch import nn
 from pydantic import BaseModel
 
 from models.common import trunc_normal_init_
-from models.layers import rms_norm, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
-from models.sparse_embedding import CastedSparseEmbedding
+from models.layers import rms_norm, SwiGLU, Attention, RotaryEmbedding
+from models.layers import CastedEmbedding, CastedLinear
+
+class MurderTreeV2Config(BaseModel):
+    hidden_size: int = 1024
+    vocab_size: int = 32768
+    seq_len: int = 2048
+    num_heads: int = 16
+    rope_theta: float = 100_000.0
+
+    tier1_depth: int = 2
+    tier1_count: int = 32
+    tier2_depth: int = 4
+    tier2_count: int = 8
+    tier3_depth: int = 8
+    tier3_count: int = 3
+
+    verifier_depth: int = 32
+    slow_verify_every: int = 8
+    max_steps: int = 64
+    ponder_cost_weight: float = 0.01
+    evolution_trigger_threshold: float = 0.35
+    num_policy_slots: int = 12
+    evolution_candidates: int = 8
+    forward_dtype: str = "bfloat16"
+    rms_eps: float = 1e-5
+
+class GriffinBlock(nn.Module):
+    def __init__(self, dim: int, heads: int = 16):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = Attention(hidden_size=dim, num_heads=heads, causal=False)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = SwiGLU(dim, expansion=4.0)
+        self.gate = nn.Parameter(torch.zeros(1, 1, dim))
+
+    def forward(self, h: torch.Tensor, inject: Optional[torch.Tensor] = None):
+        x = self.norm1(h)
+        if inject is not None:
+            x = x + inject
+        x = rms_norm(x + self.attn(hidden_states=x), 1e-5)
+        x = rms_norm(x + self.gate.tanh() * self.mlp(self.norm2(x)), 1e-5)
+        return x
+
+
+class TieredProposerBank(nn.Module):
+    def __init__(self, dim: int, depth: int, count: int):
+        super().__init__()
+        self.nets = nn.ModuleList([
+            nn.Sequential(*(GriffinBlock(dim) for _ in range(depth)))
+            for _ in range(count)
+        ])
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, states: torch.Tensor, inject: torch.Tensor) -> torch.Tensor:
+        # states: [count, B, dim], inject: [B, dim]
+        outs = []
+        for i, net in enumerate(self.nets):
+            h = states[i] if i < states.shape[0] else states[0]
+            h = net(h)
+            outs.append(self.norm(h + inject))
+        return torch.stack(outs, dim=0)  # [count, B, dim]
 
 
 @dataclass
-class HRTRMInnerCarry:
-    z_H: torch.Tensor  # High-level abstract state
-    z_L: torch.Tensor  # Low-level detailed state
+class HierarchicalReasoningModel_ACTV1InnerCarry:
+    z_H: torch.Tensor        # [total_experts, B, D]
+    z_L: torch.Tensor        # low-level memory, unused here but kept for compatibility
+    z_mem: Optional[torch.Tensor] = None      # [num_policy_slots, B, D]
+    evolution_mask: Optional[torch.Tensor] = None  # [num_policy_slots]
 
 
 @dataclass
-class HRTRMCarry:
-    inner_carry: HRTRMInnerCarry
+class HierarchicalReasoningModel_ACTV1Carry:
+    inner_carry: HierarchicalReasoningModel_ACTV1InnerCarry
     steps: torch.Tensor
     halted: torch.Tensor
     current_data: Dict[str, torch.Tensor]
 
 
-class HRTRMConfig(BaseModel):
-    batch_size: int
-    seq_len: int
-    puzzle_emb_ndim: int = 0
-    num_puzzle_identifiers: int
-    vocab_size: int
-
-    # Cycles: Recursive (TRM)
-    H_cycles: int
-    L_cycles: int
-
-    # Layers: Hierarchical (HRM)
-    H_layers: int
-    L_layers: int
-
-    # Transformer config
-    hidden_size: int
-    expansion: float
-    num_heads: int
-    pos_encodings: str
-
-    rms_norm_eps: float = 1e-5
-    rope_theta: float = 10000.0
-
-    # Halting Q-learning
-    halt_max_steps: int
-    halt_exploration_prob: float
-    no_ACT_continue: bool = False
-
-    forward_dtype: str = "bfloat16"
-
-
-class HRTRMBlock(nn.Module):
-    def __init__(self, config: HRTRMConfig, is_high_level: bool = False) -> None:
+class MurderTreeV2Core(nn.Module):
+    def __init__(self, cfg: MurderTreeV2Config):
         super().__init__()
-        self.self_attn = Attention(
-            hidden_size=config.hidden_size,
-            head_dim=config.hidden_size // config.num_heads,
-            num_heads=config.num_heads,
-            num_key_value_heads=config.num_heads,
-            causal=False,
-        )
-        self.mlp = SwiGLU(
-            hidden_size=config.hidden_size,
-            expansion=config.expansion,
-        )
-        self.norm_eps = config.rms_norm_eps
-        if is_high_level:
-            self.mlp = nn.Sequential(self.mlp, SwiGLU(hidden_size=config.hidden_size, expansion=1.5))
+        self.cfg = cfg
+        d = cfg.hidden_size
+        self.dtype = getattr(torch, cfg.forward_dtype)
 
-    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = rms_norm(
-            hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states),
-            variance_epsilon=self.norm_eps,
-        )
-        hidden_states = rms_norm(hidden_states + self.mlp(hidden_states), variance_epsilon=self.norm_eps)
-        return hidden_states
+        self.embed = CastedEmbedding(cfg.vocab_size, d, cast_to=self.dtype)
+        self.rotary = RotaryEmbedding(dim=d // cfg.num_heads, base=cfg.rope_theta)
+
+        self.input_proj = nn.Linear(d, d, bias=False)
+
+        self.tier1 = TieredProposerBank(d, cfg.tier1_depth, cfg.tier1_count)
+        self.tier2 = TieredProposerBank(d, cfg.tier2_depth, cfg.tier2_count)
+        self.tier3 = TieredProposerBank(d, cfg.tier3_depth, cfg.tier3_count)
+
+        self.verifier = nn.ModuleList([GriffinBlock(d) for _ in range(cfg.verifier_depth)])
+        self.fast_critic = nn.Linear(d, 1, bias=False)
+        self.slow_critic = nn.Linear(d, 1, bias=False)
 
 
-class HRTRMReasoningModule(nn.Module):
-    def __init__(self, config: HRTRMConfig, is_high: bool = False):
-        super().__init__()
-        layers = [HRTRMBlock(config, is_high_level=is_high) for _ in range(config.H_layers if is_high else config.L_layers)]
-        self.layers = nn.ModuleList(layers)
+        self.lm_head = CastedLinear(d, cfg.vocab_size, bias=False)
+        self.halt_head = nn.Linear(d, 2, bias=True)
+        self.evolve_head = nn.Linear(d, 1, bias=False)
 
-    def forward(self, hidden_states: torch.Tensor, input_injection: Optional[torch.Tensor] = None, **kwargs) -> torch.Tensor:
-        if input_injection is not None:
-            hidden_states = hidden_states + input_injection
-        for layer in self.layers:
-            hidden_states = layer(hidden_states=hidden_states, **kwargs)
-        return hidden_states
+        self.policy_memory = nn.Parameter(torch.zeros(cfg.num_policy_slots, d))
+        nn.init.trunc_normal_(self.policy_memory, std=0.02)
+        self.policy_router = nn.Linear(d, cfg.num_policy_slots)
+
+        self.recurrent_gate = nn.Linear(d, d, bias=False)
+
+        self.apply(self._init_weights)
+        with torch.no_grad():
+            self.halt_head.bias.fill_(-6.0)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_init_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+    def forward(
+        self,
+        carry: HierarchicalReasoningModel_ACTV1InnerCarry,
+        input_ids: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Optional[torch.Tensor]]:
+        B, T = input_ids.shape
+        d = self.cfg.hidden_size
+        device = input_ids.device
+
+        # === Embed + project + pool over sequence length ===
+        pos = torch.arange(T, device=device)
+        x = self.embed(input_ids.to(torch.int32)) * math.sqrt(d)
+        x = x + self.rotary(pos)
+        x = self.input_proj(x)               # [B, T, D]
+        inject = x.mean(dim=1)                       # [B, D]  ← this is what we inject
+
+        # === Collapse previous expert states to current recurrent state ===
+        h = carry.z_H.mean(dim=0)                    # [B, D]
+
+        # === Inject discovered policies ===
+        if carry.evolution_mask is not None and carry.evolution_mask.any():
+            active_policies = carry.z_mem[carry.evolution_mask]  # [k, B, D]
+            h = h + active_policies.mean(0) * 0.3
 
 
-class HRTRM_Inner(nn.Module):
-    def __init__(self, config: HRTRMConfig) -> None:
-        super().__init__()
-        self.config = config
-        self.forward_dtype = getattr(torch, self.config.forward_dtype)
+        t1_states = carry.z_H[:self.cfg.tier1_count]
+        t1_out = self.tier1(t1_states, inject)
 
-        # I/O
-        self.embed_scale = math.sqrt(self.config.hidden_size)
-        embed_init_std = 1.0 / self.embed_scale
-        self.embed_tokens = CastedEmbedding(
-            self.config.vocab_size, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype
-        )
-        self.lm_head = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
-        self.q_head = CastedLinear(self.config.hidden_size, 2, bias=True)
+        t2_states = carry.z_H[self.cfg.tier1_count:self.cfg.tier1_count + self.cfg.tier2_count]
+        t2_out = self.tier2(t2_states, inject)
 
-        self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)  # ceil div
-        if self.config.puzzle_emb_ndim > 0:
-            # Zero init puzzle embeddings
-            self.puzzle_emb = CastedSparseEmbedding(
-                self.config.num_puzzle_identifiers, self.config.puzzle_emb_ndim,
-                batch_size=self.config.batch_size, init_std=0, cast_to=self.forward_dtype
-            )
+        t3_states = carry.z_H[-self.cfg.tier3_count:]
+        candidates = self.tier3(t3_states, inject)           # [tier3_count, B, D]
 
-        # Positional
-        if self.config.pos_encodings == "rope":
-            self.rotary_emb = RotaryEmbedding(
-                dim=self.config.hidden_size // self.config.num_heads,
-                max_position_embeddings=self.config.seq_len + self.puzzle_emb_len,
-                base=self.config.rope_theta,
-            )
-        elif self.config.pos_encodings == "learned":
-            self.embed_pos = CastedEmbedding(
-                self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size,
-                init_std=embed_init_std, cast_to=self.forward_dtype
-            )
+
+        verify_in = candidates.mean(0)                       # [B, D]
+        slow = (carry.steps % self.cfg.slow_verify_every == 0).any()
+        if slow and self.training:
+            for block in self.verifier:
+                verify_in = block(verify_in)
+            value = self.slow_critic(verify_in.mean(0, keepdim=True))
         else:
-            raise NotImplementedError()
+            value = self.fast_critic(verify_in)
 
-        # Hierarchical Levels
-        self.H_level = HRTRMReasoningModule(config, is_high=True)
-        self.L_level = HRTRMReasoningModule(config, is_high=False)
-
-        # Initial states
-        self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
-        self.L_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
-
-        # Q-head init
-        with torch.no_grad():
-            self.q_head.weight.zero_()
-            self.q_head.bias.fill_(-5)
-
-    def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
-        # Token embedding
-        embedding = self.embed_tokens(input.to(torch.int32))
-
-        # Puzzle embeddings
-        if self.config.puzzle_emb_ndim > 0:
-            puzzle_embedding = self.puzzle_emb(puzzle_identifiers)
-            
-            pad_count = self.puzzle_emb_len * self.config.hidden_size - puzzle_embedding.shape[-1]
-            if pad_count > 0:
-                puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
-
-            embedding = torch.cat((puzzle_embedding.view(-1, self.puzzle_emb_len, self.config.hidden_size), embedding), dim=-2)
-
-        # Position embeddings
-        if self.config.pos_encodings == "learned":
-            # scale by 1/sqrt(2) to maintain forward variance
-            embedding = 0.707106781 * (embedding + self.embed_pos.embedding_weight.to(self.forward_dtype))
-
-        # Scale
-        return self.embed_scale * embedding
-
-    def empty_carry(self, batch_size: int):
-        return HRTRMInnerCarry(
-            z_H=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
-            z_L=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
-        )
-
-    def reset_carry(self, reset_flag: torch.Tensor, carry: HRTRMInnerCarry):
-        return HRTRMInnerCarry(
-            z_H=torch.where(reset_flag.view(-1, 1, 1), self.H_init, carry.z_H),
-            z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
-        )
-
-    def forward(self, carry: HRTRMInnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[HRTRMInnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        seq_info = dict(cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None)
-        # Input encoding
-        input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
-
-        z_H, z_L = carry.z_H, carry.z_L
-
-        # Recursive Cycles with Hierarchy
-        with torch.no_grad():
-            for _h in range(self.config.H_cycles - 1):
-                for _l in range(self.config.L_cycles):
-                    z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-                z_H = self.H_level(z_H, z_L, **seq_info)
-
-        # Grad-enabled last cycle
-        for _l in range(self.config.L_cycles):
-            z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-        z_H = self.H_level(z_H, z_L, **seq_info)
-
-        z_out = z_H + z_L
-        new_carry = HRTRMInnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
-        output = self.lm_head(z_out)[:, self.puzzle_emb_len :]
-
-        q_logits = self.q_head(z_out[:, 0]).to(torch.float32)
-        
-        return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
+        # === Recurrent update ===
+        gate = torch.sigmoid(self.recurrent_gate(h))
+        new_h = rms_norm(h + gate * verify_in, self.cfg.rms_eps)   # [B, D]
 
 
-class HRTRM(nn.Module):
-    """HR-TRM wrapper."""
+        logits = self.lm_head(new_h)                                 # [B, V]
+        q = self.halt_head(new_h)
+        q_halt, q_cont = q[:, 0], q[:, 1]
+        q_evolve = self.evolve_head(new_h.mean(0, keepdim=True))
 
+        # === Self-evolution (training only) ===
+        new_policy = None
+        evolve_now = (q_evolve.sigmoid() > self.cfg.evolution_trigger_threshold) and self.training
+        if evolve_now:
+            noise = torch.randn(self.cfg.evolution_candidates, B, d, device=device, dtype=self.dtype) * 0.02
+            cands = new_h.unsqueeze(0) + noise
+            cands = rms_norm(cands, self.cfg.rms_eps)
+            scores = self.slow_critic(cands.mean(1))          # [candidates, 1]
+            best = scores.squeeze(1).argmax(0)                # [B]
+            new_policy = cands[best, torch.arange(B)]
+
+            if carry.z_mem is None:
+                carry.z_mem = torch.zeros(self.cfg.num_policy_slots, B, d, device=device, dtype=self.dtype)
+                carry.evolution_mask = torch.zeros(self.cfg.num_policy_slots, dtype=torch.bool, device=device)
+
+            mask = ~carry.evolution_mask
+            if mask.any():
+                slot = mask.nonzero(as_tuple=True)[0][0]      # first free slot (shared across batch)
+                carry.z_mem[slot] = new_policy.detach()
+                carry.evolution_mask[slot] = True
+
+        return new_h, logits, (q_halt, q_cont), new_policy
+
+
+
+class HierarchicalReasoningModel_ACTV1(nn.Module):
     def __init__(self, config_dict: dict):
         super().__init__()
-        self.config = HRTRMConfig(**config_dict)
-        self.inner = HRTRM_Inner(self.config)
-
-    @property
-    def puzzle_emb(self):
-        return self.inner.puzzle_emb
+        self.old_config = config_dict
+        self.cfg = MurderTreeV2Config(
+            hidden_size=config_dict.get("hidden_size", 1024),
+            vocab_size=config_dict.get("vocab_size", 32768),
+            forward_dtype=config_dict.get("forward_dtype", "bfloat16"),
+        )
+        self.core = MurderTreeV2Core(self.cfg)
 
     def initial_carry(self, batch: Dict[str, torch.Tensor]):
-        batch_size = batch["inputs"].shape[0]
+        bs = batch["inputs"].shape[0]
+        d = self.cfg.hidden_size
+        dtype = self.core.dtype
+        device = next(self.core.parameters()).device
 
-        return HRTRMCarry(
-            inner_carry=self.inner.empty_carry(batch_size),  # Empty is expected, it will be reseted in first pass as all sequences are halted.
-            
-            steps=torch.zeros((batch_size, ), dtype=torch.int32),
-            halted=torch.ones((batch_size, ), dtype=torch.bool),  # Default to halted
-            
-            current_data={k: torch.empty_like(v) for k, v in batch.items()}
+        total_experts = self.cfg.tier1_count + self.cfg.tier2_count + self.cfg.tier3_count
+        fake_H = torch.zeros(total_experts, bs, d, device=device, dtype=dtype)
+
+        inner = HierarchicalReasoningModel_ACTV1InnerCarry(
+            z_H=fake_H,
+            z_L=torch.zeros(bs, batch["inputs"].shape[1] + 64, d, device=device,|False dtype=dtype),
+            z_mem=None,
+            evolution_mask=None,
         )
-        
-    def forward(self, carry: HRTRMCarry, batch: Dict[str, torch.Tensor]) -> Tuple[HRTRMCarry, Dict[str, torch.Tensor]]:
-        # Update data, carry (removing halted sequences)
-        new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
-        
-        new_steps = torch.where(carry.halted, 0, carry.steps)
+        return HierarchicalReasoningModel_ACTV1Carry(
+            inner_carry=inner,
+            steps=torch.zeros(bs, dtype=torch.int32, device=device),
+            halted=torch.zeros(bs, dtype=torch.bool, device=device),
+            current_data={k: v.clone() for k, v in batch.items()},
+        )
 
-        new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
+    def forward(self, carry: HierarchicalReasoningModel_ACTV1Carry, batch: Dict[str, torch.Tensor]):
+        inner = carry.inner_carry
+        inner.steps = carry.steps  # expose for slow verifier logic
 
-        # Forward inner model
-        new_inner_carry, logits, (q_halt_logits, q_continue_logits) = self.inner(new_inner_carry, new_current_data)
+        new_h, logits, (q_halt, q_cont), _ = self.core(inner, batch["inputs"])
+
+        # Update all expert states with the new recurrent state (MoE-style broadcast)
+        total_experts = self.cfg.tier1_count + self.cfg.tier2_count + self.cfg.tier3_count
+        new_z_H = inner.z_H.clone()
+        new_z_H[:] = new_h.unsqueeze(0)
+
+        new_inner = HierarchicalReasoningModel_ACTV1InnerCarry(
+            z_H=new_z_H.detach(),
+            z_L=inner.z_L,
+            z_mem=inner.z_mem,
+            evolution_mask=inner.evolution_mask,
+        )
+        carry.inner_carry = new_inner
+        carry.steps = carry.steps + 1
+
+        with torch.no_grad():
+            should_halt = (carry.steps >= self.cfg.max_steps) | (q_halt > q_cont)
+            if self.training:
+                should_halt = should_halt | (torch.rand_like(q_cont) < 0.05)
+            carry.halted = carry.halted | should_halt
 
         outputs = {
             "logits": logits,
-            "q_halt_logits": q_halt_logits,
-            "q_continue_logits": q_continue_logits
+            "q_halt_logits": q_halt,
+            "q_continue_logits": q_cont,
+            "loss_aux": self.cfg.ponder_cost_weight * carry.steps.float().mean() if self.training else None,
+            "active_policies": inner.evolution_mask.sum().item() if inner.evolution_mask is not None else 0,
         }
-        
-        with torch.no_grad():
-            # Step
-            new_steps = new_steps + 1
-            is_last_step = new_steps >= self.config.halt_max_steps
-            
-            halted = is_last_step
-
-            # if training, and ACT is enabled
-            if self.training and (self.config.halt_max_steps > 1):
-                # Halt signal
-                # NOTE: During evaluation, always use max steps, this is to guarantee the same halting steps inside a batch for batching purposes
-                if self.config.no_ACT_continue:
-                    halted = halted | (q_halt_logits > 0)
-                else:
-                    halted = halted | (q_halt_logits > q_continue_logits)
-
-                # Exploration
-                min_halt_steps = (torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.halt_max_steps + 1)
-
-                halted = halted & (new_steps >= min_halt_steps)
-
-                # Compute target Q
-                # NOTE: No replay buffer and target networks for computing target Q-value.
-                # As batch_size is large, there're many parallel envs.
-                # Similar concept as PQN https://arxiv.org/abs/2407.04811
-                if not self.config.no_ACT_continue:
-                    next_q_halt_logits, next_q_continue_logits = self.inner(new_inner_carry, new_current_data)[-1]
-                    
-                    outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
-
-        return HRTRMCarry(new_inner_carry, new_steps, halted, new_current_data), outputs
+        return carry, outputs
