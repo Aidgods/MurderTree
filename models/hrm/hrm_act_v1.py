@@ -1,7 +1,4 @@
-# recursive_murder_tree.py
-# Recursive MurderTree (RMT) — Nov 2025 SOTA contender
-# Hierarchical recursive refinement with dimension escalation
-# Size: ~140M params | Reasoning depth: up to 96 logical steps | Actually efficient
+
 
 from typing import Tuple, Dict, Optional
 import math
