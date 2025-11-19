@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from pydantic import BaseModel
 from dataclasses import dataclass
 
-# Your existing layers (keep these in models/layers/)
+
 from models.common import trunc_normal_init_
 from models.layers import rms_norm, SwiGLU, Attention, RotaryEmbedding
 from models.layers import CastedEmbedding, CastedLinear
