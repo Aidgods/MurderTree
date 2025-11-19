@@ -1,4 +1,7 @@
-
+# recursive_murder_tree.py
+# Recursive MurderTree (RMT) — Nov 2025 SOTA contender
+# Hierarchical recursive refinement with dimension escalation
+# Size: ~140M params | Reasoning depth: up to 96 logical steps | Actually efficient
 
 from typing import Tuple, Dict, Optional
 import math
@@ -8,40 +11,43 @@ import torch.nn.functional as F
 from pydantic import BaseModel
 from dataclasses import dataclass
 
+# Your existing layers (keep these in models/layers/)
 from models.common import trunc_normal_init_
 from models.layers import rms_norm, SwiGLU, Attention, RotaryEmbedding
 from models.layers import CastedEmbedding, CastedLinear
 
 
-class MurderTreeV2Config(BaseModel):
+class RMTConfig(BaseModel):
     hidden_size: int = 1024
     vocab_size: int = 32768
+    seq_len: int = 2048
     num_heads: int = 16
     rope_theta: float = 100_000.0
 
-    # Tiered proposers (progressively deeper & wider)
-    tier1_dim: int = 512
-    tier1_depth: int = 3
-    tier1_count: int = 32
+    t1_dim: int = 512
+    t1_steps: int = 12
+    t1_depth_per_step: int = 2
 
-    tier2_dim: int = 768
-    tier2_depth: int = 5
-    tier2_count: int = 12
+    t2_dim: int = 768
+    t2_steps: int = 10
+    t2_depth_per_step: int = 3
 
-    tier3_dim: int = 1024
-    tier3_depth: int = 8
-    tier3_count: int = 6
+    t3_dim: int = 1024
+    t3_steps: int = 8
+    t3_depth_per_step: int = 4
 
-    # Verification & evolution
-    verifier_depth: int = 24
+    verifier_depth: int = 12          # reduced — we don't need 24 anymore
     slow_verify_every: int = 8
-    max_steps: int = 96
+    max_ponder_steps: int = 96
     ponder_cost_weight: float = 0.01
-    evolution_trigger_threshold: float = 0.30
-    num_policy_slots: int = 12
+
+    num_policy_slots: int = 16
+    evolution_threshold: float = 0.35
     evolution_candidates: int = 8
+
     forward_dtype: str = "bfloat16"
     rms_eps: float = 1e-5
+
 
 class GriffinBlock(nn.Module):
     def __init__(self, dim: int, heads: int = 16):
@@ -61,63 +67,57 @@ class GriffinBlock(nn.Module):
         return h
 
 
-class TieredProposerBank(nn.Module):
-    def __init__(self, dim: int, depth: int, count: int):
+class RecursiveTier(nn.Module):
+    def __init__(self, dim: int, depth_per_step: int, heads: int):
         super().__init__()
-        self.nets = nn.ModuleList([
-            nn.Sequential(*(GriffinBlock(dim, heads=max(8, dim // 64)) for _ in range(depth)))
-            for _ in range(count)
+        self.blocks = nn.Sequential(*[
+            GriffinBlock(dim, heads) for _ in range(depth_per_step)
         ])
         self.norm = nn.LayerNorm(dim)
 
-    def forward_all(self, states: torch.Tensor, inject: torch.Tensor) -> torch.Tensor:
-        # states: [count, B, dim], inject: [B, dim] → returns [count, B, dim]
-        outs = []
-        for i, net in enumerate(self.nets):
-            h = net(states[i] + inject)
-            outs.append(self.norm(h))
-        return torch.stack(outs, dim=0)
+    def forward(self, z: torch.Tensor, inject: torch.Tensor, steps: int) -> torch.Tensor:
+        for _ in range(steps):
+            z = z + self.blocks(self.norm(z + inject))
+        return z
 
 
 @dataclass
 class Carry:
-    z_global: torch.Tensor      # [B, D] main recurrent state
-    z_mem: torch.Tensor         # [num_slots, B, D] discovered policies
-    steps: torch.Tensor         # [B]
-    halted: torch.Tensor        # [B]
-    evolution_mask: torch.Tensor  # [num_slots]
+    z: torch.Tensor              # [B, hidden_size] — global recurrent state
+    policies: torch.Tensor       # [num_slots, B, hidden_size] — discovered reasoning modules
+    step: torch.Tensor           # [B]
+    halted: torch.Tensor         # [B] bool
+    policy_mask: torch.Tensor    # [num_slots] bool
 
-class MurderTreeV2(nn.Module):
-    def __init__(self, config: MurderTreeV2Config):
+
+class RecursiveMurderTree(nn.Module):
+    def __init__(self, cfg: RMTConfig):
         super().__init__()
-        self.cfg = config
-        d = config.hidden_size
-        self.dtype = getattr(torch, config.forward_dtype)
+        self.cfg = cfg
+        d = cfg.hidden_size
+        self.dtype = getattr(torch, cfg.forward_dtype)
 
-        self.embed = CastedEmbedding(config.vocab_size, d, cast_to=self.dtype)
-        self.rotary = RotaryEmbedding(dim=d // config.num_heads, base=config.rope_theta)
+        self.embed = CastedEmbedding(cfg.vocab_size, d, cast_to=self.dtype)
+        self.rotary = RotaryEmbedding(dim=d // cfg.num_heads, base=cfg.rope_theta)
 
-        # Tiered proposers
-        self.tier1 = TieredProposerBank(config.tier1_dim, config.tier1_depth, config.tier1_count)
-        self.tier2 = TieredProposerBank(config.tier2_dim, config.tier2_depth, config.tier2_count)
-        self.tier3 = TieredProposerBank(config.tier3_dim, config.tier3_depth, config.tier3_count)
+        self.tier1 = RecursiveTier(cfg.t1_dim, cfg.t1_depth_per_step, heads=8)
+        self.tier2 = RecursiveTier(cfg.t2_dim, cfg.t2_depth_per_step, heads=12)
+        self.tier3 = RecursiveTier(cfg.t3_dim, cfg.t3_depth_per_step, heads=16)
 
-        self.up1 = SwiGLU(config.tier1_dim, config.tier2_dim)
-        self.up2 = SwiGLU(config.tier2_dim, config.tier3_dim)
-        self.tier3_to_hidden = nn.Identity()  # in case tier3_dim != hidden_size
+        self.up1 = SwiGLU(cfg.t1_dim, cfg.t2_dim)
+        self.up2 = SwiGLU(cfg.t2_dim, cfg.t3_dim)
+        self.down3 = SwiGLU(cfg.t3_dim, d) if cfg.t3_dim != d else nn.Identity()
 
-        # Verifier & critics
-        self.verifier = nn.ModuleList([GriffinBlock(d) for _ in range(config.verifier_depth)])
+        self.verifier = nn.ModuleList([GriffinBlock(d) for _ in range(cfg.verifier_depth)])
         self.fast_critic = nn.Linear(d, 1, bias=False)
         self.slow_critic = nn.Linear(d, 1, bias=False)
 
-        # Heads
-        self.lm_head = CastedLinear(d, config.vocab_size, bias=False)
-        self.halt_head = nn.Linear(d, 2, bias=True)
+        self.lm_head = CastedLinear(d, cfg.vocab_size, bias=False)
+        self.halt_head = nn.Linear(d, 2)
         self.evolve_head = nn.Linear(d, 1)
 
-        # Policy memory
-        self.policy_memory = nn.Parameter(torch.zeros(config.num_policy_slots, d))
+        # Latent policy memory
+        self.policy_memory = nn.Parameter(torch.zeros(cfg.num_policy_slots, d))
         nn.init.trunc_normal_(self.policy_memory, std=0.02)
 
         # Gating
@@ -125,7 +125,7 @@ class MurderTreeV2(nn.Module):
 
         self.apply(self._init_weights)
         with torch.no_grad():
-            self.halt_head.bias.fill_(-6.0)  # continue early
+            self.halt_head.bias.fill_(-8.0)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -136,121 +136,95 @@ class MurderTreeV2(nn.Module):
     def initial_carry(self, batch_size: int, device: torch.device) -> Carry:
         d = self.cfg.hidden_size
         return Carry(
-            z_global=torch.zeros(batch_size, d, device=device, dtype=self.dtype),
-            z_mem=torch.zeros(self.cfg.num_policy_slots, batch_size, d, device=device, dtype=self.dtype),
-            steps=torch.zeros(batch_size, dtype=torch.int32, device=device),
+            z=torch.zeros(batch_size, d, device=device, dtype=self.dtype),
+            policies=torch.zeros(self.cfg.num_policy_slots, batch_size, d, device=device, dtype=self.dtype),
+            step=torch.zeros(batch_size, dtype=torch.long, device=device),
             halted=torch.zeros(batch_size, dtype=torch.bool, device=device),
-            evolution_mask=torch.zeros(self.cfg.num_policy_slots, dtype=torch.bool, device=device),
+            policy_mask=torch.zeros(self.cfg.num_policy_slots, dtype=torch.bool, device=device),
         )
 
     def forward(self, carry: Carry, input_ids: torch.Tensor) -> Tuple[Carry, Dict]:
         B, T = input_ids.shape
         d = self.cfg.hidden_size
         device = input_ids.device
-        dtype = self.dtype
 
-        # === Embedding + inject ===
+        # === Embed input + positional + mean inject ===
         x = self.embed(input_ids) * math.sqrt(d)
-        pos = torch.arange(T, device=device)
+        pos = torch.arange(T, device=device).unsqueeze(0)
         x = x + self.rotary(pos)
         inject = x.mean(dim=1)  # [B, D]
 
-        h = carry.z_global
+        h = carry.z
 
-        # === Inject discovered policies ===
-        if carry.evolution_mask.any():
-            active = carry.z_mem[carry.evolution_mask]
-            h = h + active.mean(0) * 0.3
+        if carry.policy_mask.any():
+            active = carry.policies[carry.policy_mask]
+            h = h + active.mean(0) * 0.4
 
-        # Sequential Hierarchical Top-K Proposing (the magic)
-        base_inject = h
+        # === Tier 1: Fast intuitive refinement ===
+        z1 = h[:, :self.cfg.t1_dim].expand(-1, self.cfg.t1_dim)
+        z1 = self.tier1(z1, inject * 0.5, steps=self.cfg.t1_steps)
 
-        # Tier 1 — many shallow experts
-        t1_states = torch.zeros(self.cfg.tier1_count, B, self.cfg.tier1_dim, device=device, dtype=dtype)
-        t1_inject = base_inject.unsqueeze(0).expand(self.cfg.tier1_count, -1, -1)
-        t1_candidates = self.tier1.forward_all(t1_states, t1_inject)  # [32, B, 512]
-        t1_scores = self.fast_critic(t1_candidates.mean(-1)).squeeze(-1)  # [32, B]
-        topk_t1, idx1 = torch.topk(t1_scores, k=8, dim=0)  # [8, B]
-        selected_t1 = t1_candidates.gather(0, idx1.unsqueeze(-1).expand(-1, -1, self.cfg.tier1_dim))
+        # === Tier 2: Structured reasoning ===
+        z2 = self.up1(z1)
+        z2 = self.tier2(z2, inject, steps=self.cfg.t2_steps)
 
-        # Tier 2 — medium depth, attends to best Tier 1
-        t2_inject = self.up1(selected_t1.mean(0)) + base_inject
-        t2_states = torch.zeros(self.cfg.tier2_count, B, self.cfg.tier2_dim, device=device, dtype=dtype)
-        t2_inject = t2_inject.unsqueeze(0).expand(self.cfg.tier2_count, -1, -1)
-        t2_candidates = self.tier2.forward_all(t2_states, t2_inject)  # [12, B, 768]
-        t2_scores = self.fast_critic(t2_candidates.mean(-1)).squeeze(-1)
-        topk_t2, idx2 = torch.topk(t2_scores, k=4, dim=0)
-        selected_t2 = t2_candidates.gather(0, idx2.unsqueeze(-1).expand(-1, -1, self.cfg.tier2_dim))
+        # === Tier 3: Deep precise refinement ===
+        z3 = self.up2(z2)
+        new_h_raw = self.tier3(z3, inject, steps=self.cfg.t3_steps)
+        new_h_raw = self.down3(new_h_raw)
 
-        # Tier 3 — few deep experts, final proposals
-        t3_inject = self.up2(selected_t2.mean(0)) + base_inject
-        t3_states = torch.zeros(self.cfg.tier3_count, B, d, device=device, dtype=dtype)
-        t3_inject = t3_inject.unsqueeze(0).expand(self.cfg.tier3_count, -1, -1)
-        t3_candidates = self.tier3.forward_all(t3_states, t3_inject)  # [6, B, 1024]
-        t3_candidates = self.tier3_to_hidden(t3_candidates)
-
-        # Final selection
-        candidate_scores = self.fast_critic(t3_candidates.mean(-1)).squeeze(-1)  # [6, B]
-        best_idx = candidate_scores.argmax(0)  # [B]
-        verify_in = t3_candidates[best_idx, torch.arange(B)]
-
-        # Verification (slow every N steps)
-        slow = (carry.steps[0] % self.cfg.slow_verify_every == 0)
-        if slow and self.training:
+        verify_in = new_h_raw
+        if (carry.step[0] % self.cfg.slow_verify_every == 0) and self.training:
             for block in self.verifier:
                 verify_in = block(verify_in, inject)
-            value = self.slow_critic(verify_in)
+            value = self.slow_critic(verify_in.mean(0, keepdim=True))
         else:
-            value = self.fast_critic(verify_in)
+            value = self.fast_critic(verify_in.mean(0, keepdim=True))
 
-        # Recurrent update
         gate = torch.sigmoid(self.recurrent_gate(h))
         new_h = rms_norm(h + gate * verify_in, self.cfg.rms_eps)
 
         logits = self.lm_head(new_h)
         q = self.halt_head(new_h)
-        q_halt, q_cont = q[:, 0], q[:, 1]
+        q_halt, q_cont = q[..., 0], q[..., 1]
         q_evolve = self.evolve_head(new_h.mean(0, keepdim=True))
 
-        # ===================================================================
-        # Self-Evolution (training only)
-        # ===================================================================
         new_policy = None
-        evolve_now = (q_evolve.sigmoid() > self.cfg.evolution_trigger_threshold) & self.training
+        evolve_now = (q_evolve.sigmoid() > self.cfg.evolution_threshold) & self.training
         if evolve_now.any():
-            noise = torch.randn(self.cfg.evolution_candidates, B, d, device=device, dtype=dtype) * 0.02
-            cands = new_h.unsqueeze(0) + noise
-            cands = rms_norm(cands, self.cfg.rms_eps)
-            scores = self.slow_critic(cands.mean(1))
+            noise = torch.randn(self.cfg.evolution_candidates, B, d, device=device, dtype=self.dtype) * 0.03
+            candidates = new_h.unsqueeze(0) + noise
+            candidates = rms_norm(candidates, self.cfg.rms_eps)
+            scores = self.slow_critic(candidates.mean(1))
             best = scores.squeeze(1).argmax(0)
-            new_policy = cands[best, torch.arange(B)]
+            new_policy = candidates[best, torch.arange(B)]
 
-            mask = ~carry.evolution_mask
+            mask = ~carry.policy_mask
             if mask.any():
-                slot = mask.nonzero(as_tuple=False)[0, 0]  # first free slot
-                carry.z_mem[slot] = new_policy.detach()
-                carry.evolution_mask[slot] = True
+                slot = mask.nonzero(as_tuple=True)[0][0]
+                carry.policies[slot] = new_policy.detach()
+                carry.policy_mask[slot] = True
 
-        should_halt = (carry.steps >= self.cfg.max_steps) | (q_halt > q_cont)
+        should_halt = (carry.step >= self.cfg.max_ponder_steps) | (q_halt > q_cont)
         if self.training:
             should_halt = should_halt | (torch.rand_like(q_cont) < 0.05)
 
         new_carry = Carry(
-            z_global=new_h.detach(),
-            z_mem=carry.z_mem.detach(),
-            steps=carry.steps + 1,
+            z=new_h.detach(),
+            policies=carry.policies.detach(),
+            step=carry.step + 1,
             halted=carry.halted | should_halt,
-            evolution_mask=carry.evolution_mask.clone(),
+            policy_mask=carry.policy_mask.clone(),
         )
 
         outputs = {
             "logits": logits,
-            "q_halt": q_halt,
-            "q_continue": q_cont,
-            "new_reasoning_module": new_policy,
-            "active_policies": carry.evolution_mask.sum().item(),
+            "value": value,
+            "new_policy": new_policy,
+            "active_policies": carry.policy_mask.sum().item(),
+            "step": carry.step,
         }
         if self.training:
-            outputs["loss_aux"] = self.cfg.ponder_cost_weight * carry.steps.float().mean()
+            outputs["loss_aux"] = self.cfg.ponder_cost_weight * carry.step.float().mean()
 
         return new_carry, outputs
