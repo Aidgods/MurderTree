@@ -1,5 +1,3 @@
-# hierarchical_reasoning_act_v2_fixed.py
-# "MurderTree v2 — Fixed & Runnable" (Nov 2025)
 from typing import Tuple, Dict, Optional
 from dataclasses import dataclass
 import math
